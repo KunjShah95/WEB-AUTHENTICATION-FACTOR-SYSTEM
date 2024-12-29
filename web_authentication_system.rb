@@ -3,12 +3,13 @@ require 'jwt'
 require 'securerandom'
 require 'rotp'
 require 'json'
+require 'rack/utils'
 
 module WebAuthenticationSystem
   class User
-    attr_accessor :failed_attempts, :locked_until
+    attr_accessor :failed_attempts, :locked_until, :reset_token_hash, :reset_expiry
     attr_reader :id, :email, :password_hash, :two_factor_secret, :recovery_codes
-    
+
     def initialize(id, email, password_hash, two_factor_secret)
       @id = id
       @email = email
@@ -29,26 +30,49 @@ module WebAuthenticationSystem
 
   class Authentication
     def initialize
-      @jwt_secret = ENV['JWT_SECRET'] || 'default_jwt_secret' # Ensure this is securely set in production
+      @jwt_secret = ENV['JWT_SECRET'] || 'default_jwt_secret'
       @password_pepper = ENV['PASSWORD_PEPPER'] || 'default_password_pepper'
       @max_failed_attempts = 5
       @lockout_duration = 30 * 60
-      @users = {} # Replace with a database in a production system
+      @rate_limit = {}
+      @rate_limit_window = 60
+      @max_requests_per_window = 100
+      @users = Hash.new { |hash, key| hash[key] = nil }
+      @csrf_tokens = {}
     end
 
-    # Register a new user
+    # Rate limiting
+    def rate_limit(ip_address)
+      current_time = Time.now.to_i
+      @rate_limit[ip_address] ||= []
+      @rate_limit[ip_address].reject! { |timestamp| timestamp < current_time - @rate_limit_window }
+      if @rate_limit[ip_address].size >= @max_requests_per_window
+        raise AuthenticationError, "Rate limit exceeded. Try again later."
+      end
+      @rate_limit[ip_address] << current_time
+    end
+
+    # Input validation and sanitization
+    def validate_and_sanitize_input(input)
+      sanitized_input = Rack::Utils.escape_html(input)
+      raise AuthenticationError, "Invalid input detected." unless sanitized_input == input
+      sanitized_input
+    end
+
+    # Register a user
     def register_user(email, password)
+      sanitized_email = validate_and_sanitize_input(email)
       validate_password_strength(password)
-      validate_email_format(email)
-      raise AuthenticationError, "Email already registered" if @users[email]
+      validate_email_format(sanitized_email)
+      raise AuthenticationError, "Email already registered" if @users[sanitized_email]
 
       password_hash = hash_password(password)
       user_id = SecureRandom.uuid
       two_factor_secret = ROTP::Base32.random
-      user = User.new(user_id, email, password_hash, two_factor_secret)
-      @users[email] = user
+      user = User.new(user_id, sanitized_email, password_hash, two_factor_secret)
+      @users[sanitized_email] = user
 
-      send_email(email, "Welcome! Your 2FA secret is: #{two_factor_secret}")
+      send_email(sanitized_email, "Welcome! Your 2FA secret is: #{two_factor_secret}")
 
       {
         user_id: user_id,
@@ -57,9 +81,35 @@ module WebAuthenticationSystem
       }
     end
 
+    # Generate CSRF token
+    def generate_csrf_token
+      token = SecureRandom.hex(32)
+      @csrf_tokens[token] = Time.now + 3600 # 1-hour expiry
+      token
+    end
+
+    # Validate CSRF token
+    def validate_csrf_token(token)
+      raise AuthenticationError, "Invalid CSRF token" unless @csrf_tokens[token] && @csrf_tokens[token] > Time.now
+      @csrf_tokens.delete(token)
+    end
+
+    # Secure HTTP headers
+    def secure_http_headers
+      {
+        'Strict-Transport-Security' => 'max-age=63072000; includeSubDomains',
+        'X-Frame-Options' => 'DENY',
+        'X-Content-Type-Options' => 'nosniff',
+        'Content-Security-Policy' => "default-src 'self'",
+        'Referrer-Policy' => 'no-referrer'
+      }
+    end
+
     # Authenticate user
-    def authenticate(email, password, totp_code = nil)
-      user = @users[email]
+    def authenticate(email, password, totp_code = nil, ip_address = nil)
+      rate_limit(ip_address) if ip_address
+      sanitized_email = validate_and_sanitize_input(email)
+      user = @users[sanitized_email]
       raise AuthenticationError, "User not found" unless user
 
       if user.locked_until && Time.now < user.locked_until
@@ -79,21 +129,6 @@ module WebAuthenticationSystem
       end
 
       generate_token(user)
-    end
-
-    # Initiate password reset
-    def initiate_password_reset(email)
-      user = @users[email]
-      raise AuthenticationError, "User not found" unless user
-
-      reset_token = SecureRandom.hex(32)
-      reset_token_hash = hash_password(reset_token)
-      expiry = Time.now + 3600
-
-      user.instance_variable_set(:@reset_token_hash, reset_token_hash)
-      user.instance_variable_set(:@reset_expiry, expiry)
-
-      send_email(email, "Your password reset token: #{reset_token}")
     end
 
     private
@@ -145,6 +180,7 @@ module WebAuthenticationSystem
     end
 
     def send_email(email, message)
+      # Implement actual email sending logic here
       puts "Simulating email to #{email}: #{message}"
     end
 
